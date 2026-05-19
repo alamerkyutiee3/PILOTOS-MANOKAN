@@ -1,0 +1,118 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return request.auth.token.email_verified == true;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isInitialAdmin() {
+      return isSignedIn() && (request.auth.token.email.lower() == 'pilotosjm3@gmail.com' || 
+             request.auth.token.email.lower() == 'alhakimelbanez@gmail.com');
+    }
+
+    function isAdmin() {
+      return isInitialAdmin() || (
+             isSignedIn() && 
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'
+      );
+    }
+
+    function isStaff() {
+      return isAdmin() || (
+             isSignedIn() && 
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'staff'
+      );
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // --- Authorized Emails ---
+    match /authorized_emails/{email} {
+      allow get: if isSignedIn() && (request.auth.token.email.lower() == email.lower() || isAdmin());
+      allow list: if isAdmin();
+      allow write: if isAdmin();
+    }
+
+    // --- User Profiles ---
+    match /users/{userId} {
+      function isValidUser(data) {
+        return data.keys().hasAll(['uid', 'email', 'role', 'displayName', 'createdAt']) &&
+               data.uid is string &&
+               data.email is string &&
+               data.role in ['admin', 'staff'];
+      }
+
+      allow get: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      allow list: if isAdmin();
+      
+      allow create: if isSignedIn() && isValidUser(request.resource.data) && (
+        (isInitialAdmin() && request.resource.data.role == 'admin') ||
+        (request.resource.data.role == 'staff' && exists(/databases/$(database)/documents/authorized_emails/$(request.resource.data.email.lower())))
+      );
+      
+      allow update: if isSignedIn() && (
+        // Admins can update roles
+        (isAdmin() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role'])) ||
+        // Users can update their own profile fields
+        (request.auth.uid == userId && request.resource.data.diff(resource.data).affectedKeys().hasAny(['displayName', 'fullName', 'age', 'address', 'birthdate', 'profilePic']))
+      ) && isValidUser(request.resource.data);
+
+      allow delete: if isAdmin();
+    }
+
+    // --- Products ---
+    match /products/{productId} {
+      function isValidProduct(data) {
+        return data.keys().hasAll(['name', 'unit', 'price', 'stock', 'lowStockThreshold', 'updatedAt']) &&
+               data.keys().size() == 6 &&
+               data.name is string && data.name.size() <= 100 &&
+               data.unit in ['kg', 'pcs'] &&
+               data.price is number && data.price >= 0 &&
+               data.stock is number &&
+               data.lowStockThreshold is number &&
+               data.updatedAt is timestamp;
+      }
+
+      allow read: if isStaff();
+      allow create: if isAdmin() && isValidProduct(request.resource.data);
+      allow update: if (isAdmin() || isStaff()) && // Staff might update stock during POS
+                      isValidProduct(request.resource.data) &&
+                      (isAdmin() || request.resource.data.diff(resource.data).affectedKeys().hasOnly(['stock', 'updatedAt']));
+      allow delete: if isAdmin();
+    }
+
+    // --- Sales ---
+    match /sales/{saleId} {
+      function isValidSale(data) {
+        return data.keys().hasAll(['items', 'total', 'cashierId', 'cashierName', 'timestamp']) &&
+               data.keys().size() == 5 &&
+               data.items is list && data.items.size() <= 50 &&
+               data.total is number && data.total >= 0 &&
+               data.cashierId == request.auth.uid &&
+               data.timestamp == request.time;
+      }
+
+      allow read: if isStaff();
+      allow create: if isStaff() && isValidSale(request.resource.data);
+      allow update, delete: if false; // Sales are immutable
+    }
+  }
+}
